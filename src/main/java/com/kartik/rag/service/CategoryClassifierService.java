@@ -1,28 +1,34 @@
+
 package com.kartik.rag.service;
+
+import java.util.List;
+import java.util.Locale;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.reactive.function.client.WebClientResponseException;
-
-import reactor.core.publisher.Mono;
 
 @Service
 public class CategoryClassifierService {
 
-    private static final Logger log = LoggerFactory.getLogger(CategoryClassifierService.class);
+    private static final Logger log =
+            LoggerFactory.getLogger(CategoryClassifierService.class);
 
-    private final WebClient openAiWebClient;
+    private final WebClient ollamaWebClient;
     private final String chatModel;
     private final String labelList;
 
-    public CategoryClassifierService(WebClient openAiWebClient,
-                                     @Value("${openai.chat-model}") String chatModel,
-                                     @Value("${category.labels:HISTORY,CHILDCARE,LEGAL,TECHNOLOGY,FINANCE,SCIENCE,HEALTH,LITERATURE,FICTION,BUSINESS,EDUCATION,OTHER}") String labelList) {
-        this.openAiWebClient = openAiWebClient;
+    public CategoryClassifierService(
+            @Qualifier("ollamaWebClient") WebClient ollamaWebClient,
+            @Value("${ollama.chat-model:llama3.2:3b}") String chatModel,
+            @Value("${category.labels:HISTORY,CHILDCARE,LEGAL,TECHNOLOGY,FINANCE,SCIENCE,HEALTH,LITERATURE,FICTION,BUSINESS,EDUCATION,OTHER}")
+            String labelList) {
+
+        this.ollamaWebClient = ollamaWebClient;
         this.chatModel = chatModel;
         this.labelList = labelList;
     }
@@ -31,26 +37,48 @@ public class CategoryClassifierService {
         if (text == null || text.isBlank()) {
             return fallback;
         }
-        String sample = text.length() > 2000 ? text.substring(0, 2000) : text;
-        ChatCompletionRequest request = new ChatCompletionRequest(chatModel, java.util.List.of(
-                new ChatMessage("system", "Classify the document into one of: " + labelList + ". Reply with the single label only."),
-                new ChatMessage("user", sample)
-        ));
+
+        String sample = text.length() > 2000
+                ? text.substring(0, 2000)
+                : text;
+
+        OllamaChatRequest request = new OllamaChatRequest(
+                chatModel,
+                List.of(
+                        new ChatMessage(
+                                "system",
+                                "Classify the document into exactly one of these labels: "
+                                        + labelList
+                                        + ". Reply with the single label only."),
+                        new ChatMessage("user", sample)),
+                false,
+                new ChatOptions(0.0));
+
         try {
-            ChatCompletionResponse response = openAiWebClient.post()
-                    .uri("/chat/completions")
+            OllamaChatResponse response = ollamaWebClient.post()
+                    .uri("/api/chat")
+                    .contentType(MediaType.APPLICATION_JSON)
                     .bodyValue(request)
                     .retrieve()
-                    .bodyToMono(ChatCompletionResponse.class)
-                    .onErrorResume(WebClientResponseException.class, ex -> Mono.error(new EmbeddingService.OpenAiException((HttpStatus) ex.getStatusCode(), ex.getResponseBodyAsString())))
+                    .bodyToMono(OllamaChatResponse.class)
                     .block();
-            if (response == null || response.choices == null || response.choices.isEmpty()) {
+
+            if (response == null
+                    || response.message() == null
+                    || response.message().content() == null) {
                 return fallback;
             }
-            String label = response.choices.get(0).message.content;
+
+            String label = response.message().content();
             String result = normalize(label, fallback);
-            log.info("Auto-classified document as {} from model label '{}'", result, label);
+
+            log.info(
+                    "Auto-classified document as {} from model label '{}'",
+                    result,
+                    label);
+
             return result;
+
         } catch (Exception e) {
             log.warn("Category classification failed: {}", e.getMessage());
             return fallback;
@@ -61,26 +89,38 @@ public class CategoryClassifierService {
         if (value == null || value.isBlank()) {
             return fallback;
         }
-        String cleaned = value.trim().toLowerCase();
-        // Optionally restrict to provided labels; otherwise accept as-is.
+
+        String cleaned = value.trim()
+                .replaceAll("^[`'\"\\s]+|[`'\"\\s]+$", "")
+                .toLowerCase(Locale.ROOT);
+
         String[] labels = labelList.split(",");
+
         for (String label : labels) {
-            if (cleaned.equalsIgnoreCase(label.trim())) {
-                return label.trim().toLowerCase();
+            if (cleaned.equals(label.trim().toLowerCase(Locale.ROOT))) {
+                return label.trim().toLowerCase(Locale.ROOT);
             }
         }
-        return cleaned;
+
+        return fallback;
     }
 
-    private record ChatCompletionRequest(String model, java.util.List<ChatMessage> messages) {
+    private record OllamaChatRequest(
+            String model,
+            List<ChatMessage> messages,
+            boolean stream,
+            ChatOptions options) {
     }
 
-    private record ChatCompletionResponse(java.util.List<Choice> choices) {
-    }
-
-    private record Choice(ChatMessage message) {
+    private record ChatOptions(double temperature) {
     }
 
     private record ChatMessage(String role, String content) {
+    }
+
+    private record OllamaChatResponse(OllamaMessage message) {
+    }
+
+    private record OllamaMessage(String role, String content) {
     }
 }

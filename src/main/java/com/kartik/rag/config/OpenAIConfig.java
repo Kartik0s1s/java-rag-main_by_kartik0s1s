@@ -1,10 +1,9 @@
+
 package com.kartik.rag.config;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.ExchangeStrategies;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -12,16 +11,23 @@ import org.springframework.web.reactive.function.client.WebClient;
 public class OpenAIConfig {
 
     @Bean
-    public WebClient openAiWebClient(
-            @Value("${openai.base-url}") String baseUrl,
-            @Value("${openai.api.key}") String apiKey) {
+    public WebClient.Builder webClientBuilder() {
         return WebClient.builder()
+                .exchangeStrategies(
+                        ExchangeStrategies.builder()
+                                .codecs(codecs -> codecs.defaultCodecs()
+                                        .maxInMemorySize(16 * 1024 * 1024))
+                                .build());
+    }
+
+    @Bean
+    public WebClient ollamaWebClient(
+            WebClient.Builder webClientBuilder,
+            @Value("${ollama.base-url:http://localhost:11434}")
+            String baseUrl) {
+
+        return webClientBuilder
                 .baseUrl(baseUrl)
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + apiKey)
-                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                .exchangeStrategies(ExchangeStrategies.builder()
-                        .codecs(codecs -> codecs.defaultCodecs().maxInMemorySize(4 * 1024 * 1024))
-                        .build())
                 .build();
     }
 }

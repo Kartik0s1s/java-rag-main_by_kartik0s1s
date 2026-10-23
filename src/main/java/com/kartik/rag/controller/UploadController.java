@@ -89,18 +89,22 @@ public class UploadController {
             String resolvedCategory = resolveCategory(category, extractedText);
             log.info("Upload received: filename={}, documentId={}, category={}", file.getOriginalFilename(), documentId, resolvedCategory);
             persistDocument(documentId, file.getOriginalFilename(), resolvedCategory, fingerprint);
+
             // 2. Chunk: split the document into overlapping segments to retain relevant context.
             List<Chunk> chunks = chunkService.chunk(documentId, extractedText);
             log.info("Chunked document {} into {} chunks", documentId, chunks.size());
+
             // 3. Embed: batch OpenAI calls to reduce round-trips while preserving chunk order.
             List<float[]> embeddings = embeddingService.embedBatch(
                     chunks.stream().map(Chunk::getContent).toList());
             for (int i = 0; i < chunks.size(); i++) {
                 chunks.get(i).setEmbedding(embeddings.get(i));
             }
+
             // 4. Store: persist both textual content and embeddings in pgvector for future retrieval.
             int count = vectorStoreService.persistChunks(chunks);
             log.info("Uploaded document {} with {} chunks", documentId, count);
+
             // Kick off KG ingestion for pending docs asynchronously.
             runKgIngestionAsync();
             return ResponseEntity.ok(new UploadResponse(documentId, count));

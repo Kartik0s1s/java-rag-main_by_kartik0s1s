@@ -1,100 +1,137 @@
+
 package com.kartik.rag.service;
 
 import java.util.List;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import reactor.core.publisher.Mono;
 
 @Service
 public class KgExtractionService {
 
-    private static final Logger log = LoggerFactory.getLogger(KgExtractionService.class);
+    private static final Logger log =
+            LoggerFactory.getLogger(KgExtractionService.class);
 
-    private final WebClient openAiWebClient;
+    private final WebClient ollamaWebClient;
     private final String chatModel;
     private final ObjectMapper objectMapper;
 
-    public KgExtractionService(WebClient openAiWebClient,
-                               @Value("${openai.chat-model}") String chatModel,
-                               ObjectMapper objectMapper) {
-        this.openAiWebClient = openAiWebClient;
+    public KgExtractionService(
+            @Qualifier("ollamaWebClient") WebClient ollamaWebClient,
+            @Value("${ollama.chat-model:llama3.2:3b}") String chatModel,
+            ObjectMapper objectMapper) {
+
+        this.ollamaWebClient = ollamaWebClient;
         this.chatModel = chatModel;
         this.objectMapper = objectMapper;
     }
 
     public ExtractionResult extract(List<ChunkRow> chunks) {
         if (chunks == null || chunks.isEmpty()) {
-            return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
+            return emptyResult();
         }
+
         log.info("Starting KG extraction on {} chunks", chunks.size());
+
         StringBuilder sb = new StringBuilder();
-        chunks.forEach(c -> {
-            sb.append("[chunk ").append(c.chunkIndex()).append("] ").append(c.content()).append("\n\n");
-        });
+
+        chunks.forEach(c -> sb.append("[chunk ")
+                .append(c.chunkIndex())
+                .append("] ")
+                .append(c.content())
+                .append("\n\n"));
 
         String prompt = """
-                You are an information extraction system. Read the provided chunks and extract structured knowledge graph data.
-                Output ONLY valid JSON in the following shape:
+                You are an information extraction system.
+                Read the provided chunks and extract structured knowledge graph data.
+
+                Output ONLY valid JSON in this exact shape:
                 {
                   "entities":[{"name":"","canonicalKey":"","entityType":"","description":"","aliases":[""]}],
                   "events":[{"eventType":"","eventCategory":"","name":"","chapter":"","location":"","startYear":null,"endYear":null}],
                   "participants":[{"eventName":"","actorName":"","role":"","outcome":"","chunkIndex":0}],
                   "relations":[{"subjectName":"","predicate":"","objectName":"","objectText":"","chunkIndex":0}]
                 }
+
                 Guidelines:
                 - Use lowercase with underscores for canonicalKey (e.g., "cao_cao").
-                - eventType is a short label like "battle", "incident", "visit".
+                - eventType is a short label like "battle", "incident", or "visit".
                 - Link participants to events by matching eventName and actorName.
-                - chunkIndex should reference the chunk number where you saw the fact.
+                - chunkIndex must reference the chunk number where the fact appears.
+                - Do not invent facts that are absent from the text.
+                - Use empty arrays when no items of a type can be extracted.
+                - Use null for unknown years.
+                - Return JSON only, without markdown fences or explanations.
+
                 Text:
                 """ + sb;
 
-        ChatCompletionRequest request = new ChatCompletionRequest(chatModel, List.of(
-                new ChatMessage("system", "Extract structured entities, events, participants, and relations from the text. Output JSON only."),
-                new ChatMessage("user", prompt)
-        ), 1.0);
+        OllamaChatRequest request = new OllamaChatRequest(
+                chatModel,
+                List.of(
+                        new ChatMessage(
+                                "system",
+                                "Extract structured entities, events, participants, "
+                                        + "and relations from text. Return valid JSON only."),
+                        new ChatMessage("user", prompt)),
+                false,
+                new ChatOptions(0.0, "json"));
 
         try {
-            String response = openAiWebClient.post()
-                    .uri("/chat/completions")
+            OllamaChatResponse response = ollamaWebClient.post()
+                    .uri("/api/chat")
+                    .contentType(MediaType.APPLICATION_JSON)
                     .bodyValue(request)
                     .retrieve()
-                    .bodyToMono(String.class)
-                    .onErrorResume(WebClientResponseException.class, ex -> Mono.error(new EmbeddingService.OpenAiException((HttpStatus) ex.getStatusCode(), ex.getResponseBodyAsString())))
+                    .bodyToMono(OllamaChatResponse.class)
                     .block();
-            if (response == null || response.isBlank()) {
+
+            if (response == null
+                    || response.message() == null
+                    || response.message().content() == null
+                    || response.message().content().isBlank()) {
+
                 log.warn("KG extraction returned empty response");
-                return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
+                return emptyResult();
             }
-            ChatCompletionResponse parsed = objectMapper.readValue(response, ChatCompletionResponse.class);
-            if (parsed.choices == null || parsed.choices.isEmpty()) {
-                log.warn("KG extraction returned no choices");
-                return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
-            }
-            String content = parsed.choices.get(0).message.content;
-            if (content == null || content.isBlank()) {
-                log.warn("KG extraction returned blank content");
-                return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
-            }
-            ExtractionResult result = parseContent(content);
-            log.info("KG extraction parsed entities={} events={} participants={} relations={}",
-                    safeSize(result.entities()), safeSize(result.events()), safeSize(result.participants()), safeSize(result.relations()));
+
+            ExtractionResult result =
+                    parseContent(response.message().content());
+
+            log.info(
+                    "KG extraction parsed entities={} events={} participants={} relations={}",
+                    safeSize(result.entities()),
+                    safeSize(result.events()),
+                    safeSize(result.participants()),
+                    safeSize(result.relations()));
+
             return result;
+
         } catch (Exception e) {
-            log.error("KG extraction failed to parse response: {}", e.getMessage());
-            return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
+            log.error("KG extraction failed: {}", e.getMessage());
+            return emptyResult();
         }
     }
 
-    public record ChunkRow(java.util.UUID id, int chunkIndex, String content) {
+    private ExtractionResult emptyResult() {
+        return new ExtractionResult(
+                List.of(),
+                List.of(),
+                List.of(),
+                List.of());
+    }
+
+    public record ChunkRow(
+            java.util.UUID id,
+            int chunkIndex,
+            String content) {
     }
 
     public record ExtractionResult(
@@ -104,16 +141,38 @@ public class KgExtractionService {
             List<ExtractedRelation> relations) {
     }
 
-    public record ExtractedEntity(String name, String canonicalKey, String entityType, String description, List<String> aliases) {
+    public record ExtractedEntity(
+            String name,
+            String canonicalKey,
+            String entityType,
+            String description,
+            List<String> aliases) {
     }
 
-    public record ExtractedEvent(String eventType, String eventCategory, String name, String chapter, String location, Integer startYear, Integer endYear) {
+    public record ExtractedEvent(
+            String eventType,
+            String eventCategory,
+            String name,
+            String chapter,
+            String location,
+            Integer startYear,
+            Integer endYear) {
     }
 
-    public record ExtractedParticipant(String eventName, String actorName, String role, String outcome, Integer chunkIndex) {
+    public record ExtractedParticipant(
+            String eventName,
+            String actorName,
+            String role,
+            String outcome,
+            Integer chunkIndex) {
     }
 
-    public record ExtractedRelation(String subjectName, String predicate, String objectName, String objectText, Integer chunkIndex) {
+    public record ExtractedRelation(
+            String subjectName,
+            String predicate,
+            String objectName,
+            String objectText,
+            Integer chunkIndex) {
     }
 
     private int safeSize(List<?> list) {
@@ -124,17 +183,22 @@ public class KgExtractionService {
         try {
             return objectMapper.readValue(content, ExtractionResult.class);
         } catch (Exception e) {
-            log.warn("Primary parse failed, attempting fallback JSON extraction. Content snippet: {}", snippet(content));
+            log.warn(
+                    "Primary parse failed; attempting fallback JSON extraction. Content snippet: {}",
+                    snippet(content));
+
             String fallback = extractJson(content);
+
             if (fallback == null) {
                 log.error("KG extraction content could not be parsed as JSON");
-                return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
+                return emptyResult();
             }
+
             try {
                 return objectMapper.readValue(fallback, ExtractionResult.class);
             } catch (Exception ex) {
                 log.error("Fallback parse failed: {}", ex.getMessage());
-                return new ExtractionResult(List.of(), List.of(), List.of(), List.of());
+                return emptyResult();
             }
         }
     }
@@ -142,26 +206,49 @@ public class KgExtractionService {
     private String extractJson(String text) {
         int start = text.indexOf('{');
         int end = text.lastIndexOf('}');
+
         if (start >= 0 && end > start) {
             return text.substring(start, end + 1);
         }
+
         return null;
     }
 
     private String snippet(String text) {
-        if (text == null) return "";
-        return text.length() > 500 ? text.substring(0, 500) + "..." : text;
+        if (text == null) {
+            return "";
+        }
+
+        return text.length() > 500
+                ? text.substring(0, 500) + "..."
+                : text;
     }
 
-    private record ChatCompletionRequest(String model, List<ChatMessage> messages, double temperature) {
+    private record OllamaChatRequest(
+            String model,
+            List<ChatMessage> messages,
+            boolean stream,
+            ChatOptions options,
+            String format) {
+
+        OllamaChatRequest(
+                String model,
+                List<ChatMessage> messages,
+                boolean stream,
+                ChatOptions options) {
+            this(model, messages, stream, options, options.format());
+        }
     }
 
-    private record ChatCompletionResponse(List<Choice> choices) {
-    }
-
-    private record Choice(ChatMessage message) {
+    private record ChatOptions(double temperature, String format) {
     }
 
     private record ChatMessage(String role, String content) {
+    }
+
+    private record OllamaChatResponse(OllamaMessage message) {
+    }
+
+    private record OllamaMessage(String role, String content) {
     }
 }
